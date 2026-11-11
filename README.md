@@ -1,3 +1,565 @@
+<!-- 中文说明开始 -->
+
+# 🇨🇳 中文详细说明 · ARTEX（AI 自主渗透测试系统）
+
+> **本节是给中文读者写的通俗版说明，面向完全没用过渗透测试工具的朋友。**
+> 下方「↓ 上游 README 原文开始 ↓」以下是上游 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX) 的原文，**一字未删**，包含完整的安装、更新、配置说明。
+
+---
+
+## ⚠️ 先看这一条：合规提醒
+
+ARTEX 是一个**渗透测试**工具，也就是俗称「黑客工具箱」的东西。仓库里写得很清楚：
+
+> **严禁将本工具对任何网站、线上服务或联网系统发起扫描、探测、利用或攻击**（无论是否获得授权、是否为自有资产）。
+
+- ✅ **可以做**：在自己电脑上、在完全隔离的本地环境里（比如自己搭的靶场、CTF 练习环境），研究源码、理解原理、学习技术
+- ❌ **不能做**：拿它去扫任何真实存在的线上网站或服务
+- 使用者要自己遵守所在地的法律法规（中国大陆包括《网络安全法》《数据安全法》《个人信息保护法》）
+- 一切后果由使用者自己承担
+
+许可证是 **AGPL-3.0**（比 MIT 严格）：如果你改了它还部署成在线服务给别人用，**必须公开你的修改后源码**。
+
+---
+
+## 一、这是什么（一句话说清）
+
+**ARTEX 是一个让 AI 自己去「黑」目标网站的系统 —— 相当于把一群有自主性的安全研究员关进黑盒里，让它们自动侦察、自动找漏洞、自动出报告。**
+
+拆开看三个部分：
+
+| 部分 | 是什么 | 用大白话说 |
+| --- | --- | --- |
+| **Go 后端** | `cmd/artex` 编译出的单个二进制文件 | 整个系统的「大脑 + 服务器」，负责调度 AI、存数据、提供 API |
+| **Next.js 前端** | 浏览器里的管理控制台 | 你的「驾驶舱」，看仪表盘、管任务、看漏洞报告 |
+| **AI Agent 层** | 基于 `norma` SDK 的多智能体系统 | 真正干活的一群「AI 员工」 |
+
+### 打个比方
+
+你要做一次「网站安全体检」，传统做法是：
+
+1. 人工整理一份资产清单（有哪些域名、哪些接口）
+2. 人工用 nmap / sqlmap / burp 一堆工具逐个测
+3. 测完人工写报告
+4. 同一类问题在 50 个接口上重复 50 遍
+
+ARTEX 的做法是：你告诉 AI「我要测 https://example.com，范围是这个公司」，然后：
+
+- **goals（目标）**：AI 先把目标拆成「要探测哪些子域、哪些接口、找什么类型的漏洞」
+- **planner（规划者）**：只负责「决定下一步该往哪个方向走」，是整个系统里**唯一**生成「意图」的角色
+- **worker（执行者）**：几十个并发 worker，每个领一条意图，用真实的 Kali 工具去干，干完把结果写回数据库
+- **mainagent（人在环路）**：你随时可以在界面上插话、纠正方向
+
+**关键点**：不是「一个 AI 乱扫」，而是**有组织的多 AI 协作**，并且每一步都有留痕（流量录制）。
+
+---
+
+## 二、适合谁用 / 能解决什么问题
+
+### ✅ 适合你，如果你是
+
+| 你是 | 你会得到什么 |
+| --- | --- |
+| **安全研究员 / 白帽子** | 一个能自动干活的测试平台，用来在授权范围内摸清自己的资产 |
+| **甲方安全团队** | 批量资产体检的效率工具，AI 出初版报告，人来复核 |
+| **想学渗透测试的学生** | 把工具链和攻击方法论串起来的完整实现，源码可读可改 |
+| **AI Agent 方向的开发者** | 一个生产级的多智能体系统参考实现：双图架构、事件驱动引擎、审批门、过程级信息交换 |
+| **做安全产品的工程师** | 「AI + 安全」这条路的现成底座，二次开发很快 |
+
+### 🎯 能解决的具体问题
+
+1. **「资产清单整理」太耗时** —— 支持从 ScopeSentry 直接同步资产，按公司范围自动归并
+2. **「同一类漏洞要测 100 个接口」** —— 批量 worker 并发执行
+3. **「攻击链断了」** —— planner 用跨轮共享的 todolist，把「发现注入点 → 拿凭据 → 横向 → 提权」这种有依赖关系的多步链**按顺序**推进，不会一次性乱派
+4. **「AI 之间重复劳动」** —— worker 之间可以按关键字检索**其他 worker 的执行过程**，直接复用别人的观察
+5. **「报告写起来太累」** —— 同一实际缺陷会被自动归并成一个「漏洞文件夹」，生成一份统一报告，原始上报全部保留
+6. **「改完了不知道修没修好」** —— 内置「漏洞复测」Agent，结论分「仍可复现 / 已修复 / 无法确认」
+
+---
+
+## 三、核心功能
+
+### 3.1 双图架构 —— 这是整个系统的灵魂
+
+ARTEX 把「**目标是什么**」和「**测到了什么程度**」拆成两张独立的图：
+
+| | 资产图（Asset Graph） | 探索图（Exploration Graph） |
+| --- | --- | --- |
+| **范围** | **全局共享**，所有任务共用一份真值库 | **每个任务独立**，记录这次探索的思考过程 |
+| **节点** | `root_domain` / `subdomain` / `ip` / `service` / `app` / `endpoint` | `goal`（目标）/ `intent`（意图）/ `fact`（事实）/ `finding`（漏洞）/ `hint`（提示） |
+| **边** | 域名 → 子域 → 服务 → 端点 的父子关系 | `spawns` / `derived_from` / `yields` / `proves` 等**血缘链** |
+| **回答的问题** | 「我们公司到底有哪些资产？」 | 「这个结论是从哪条思路来的？」 |
+
+**两张图靠锚点相连**：表 `exploration_anchors(node_id, asset_id)` 把意图/事实/漏洞锚定到具体资产上。于是：
+
+- 从「探索方向」能看它打的是哪些资产
+- 从「某个资产」能反查它被哪些意图测过、得出过哪些结论
+- 支撑起**资产测试覆盖度**和**资产覆盖图**（范围内资产 + 已测高亮）
+
+### 3.2 事件驱动的引擎
+
+```
+图变了 → 唤醒 planner → planner 派意图 → worker 领意图执行
+  ↑                                              ↓
+  └────── 写回 fact / asset / finding ←──────────┘
+```
+
+**大多数唤醒 planner 会派 0 个意图**（没有新方向就结束）—— 这一点很关键，说明系统不会为了「干点活」而乱跑。
+
+### 3.3 Worker 之间的「过程级」信息交换
+
+很多有价值的观察（某个报错、某段响应、某个隐藏参数）出现在一个 worker 的**执行过程**里，还没被写成正式的 fact。ARTEX 提供三个工具解决这个：
+
+| 工具 | 作用 |
+| --- | --- |
+| `search_all_worker_traces(q)` | 在本任务**其他 worker** 的执行过程里按关键字检索（自动排除自己这条意图） |
+| `list_worker_traces` | 看有哪些 work 跑过 |
+| `get_worker_trace(intent_id, step_ids=[…])` | 取某个 worker 具体几步的完整内容 |
+
+**效果**：worker C 能直接复用 worker A 在第 3 步看到的报错信息，不用自己重跑一遍。
+
+### 3.4 审批门（guard / intercept）
+
+worker 想执行某些敏感命令时，会被**卡住**，弹出一个审批对话框等你确认。
+
+- 全局「审批记录」
+- 任务内「拦截审批」
+- 对话里的审批卡片
+
+三处都能展开看详情（结构参考 AegisHook 的审批详情组件，沿用 ARTEX 自己的组件和主题）。
+
+### 3.5 流量录制代理（MITM）
+
+`-proxy :8788` 启动一个中间人代理，**全程录下** worker 发出的 HTTP 请求和收到的响应，包括 CA 验证细节。
+
+**为什么重要**：漏洞报告里光写「存在 SQL 注入」没有说服力，有了流量包才能证明「真的能打穿」。仓库里有专门的文档 `docs/漏洞流量证据.md`。
+
+### 3.6 漏洞归并与统一报告
+
+同一任务内，Reporter（报告 agent）依据**目标、接口参数、权限边界、根因及验证证据**判断是否同一实际缺陷，形成「漏洞文件夹」。
+
+- 只是类型或名称相同 → **不会**自动归并
+- 严重程度、接口、后端或读写影响不同 → **仍可能是**同一漏洞
+- 共用登录入口或令牌 → **不能单独**证明同一根因
+- 证据不足时会提「人工建议」，需要你点「确认归并」
+
+文件夹标题栏显示 `严/高/中/低` 数量统计（按原始记录数），独立漏洞数按文件夹去重。
+
+### 3.7 漏洞复测
+
+任务详情 → 「复测」页签 → 勾选漏洞 → 填写可选的修复版本/测试条件 → 发起复测。
+
+- 会创建**独立的复测 Agent 会话**
+- 结论分三类：**仍可复现** / **已修复** / **无法确认**
+- 结论为「已修复」时自动把漏洞状态改成「已修复」
+- 不需要重新启动原来的扫描任务
+
+### 3.8 任务情报（凭据与敏感数据集中管理）
+
+在「系统配置 → 任务情报」开启 **Agent 自动记录**后，worker 可以调 `record_intelligence` 上报凭据和线索。
+
+- 开关**默认关闭**，关闭时不注入情报工具、不额外消耗 token
+- 开启会增加提示与上报的 token 消耗
+- 情报随任务归档、恢复、删除
+- 归档格式 v4，仍支持读 v1–v3
+
+### 3.9 远程 MCP 接入
+
+系统设置里可以选 `http`（Streamable HTTP）或 `sse`（旧版 SSE），让外部 MCP 客户端连进来。
+
+- SSE 用 `GET /sse` 建立事件流，再通过服务返回的 `/message?sessionId=...` 接收 JSON-RPC 请求
+- 配置时 URL 填 `/sse`，请求头按 `Authorization=Bearer <token>` 填写
+
+### 3.10 通知渠道
+
+`notify/` 包支持多种推送：**Email、飞书、钉钉、HTTP webhook**，还带脱敏（mask）和 Markdown 渲染。
+
+### 3.11 其他支撑
+
+- **LLM 池**（`llmpool`）：多个 LLM 端点的健康检查与轮换
+- **LLM 录制**（`llmrec`）：录制 LLM 调用，用于复盘
+- **异步补全**（`enrich`）：DNS / HTTP 信息的异步补全
+- **自定义工具**（`customtool`）：用户自己加工具
+- **技能**（`skills/`）：内置 3 个 —— `api-recon`（API 侦察）、`playwright-cli`（浏览器自动化）、`scopesentry`（资产同步）
+
+---
+
+## 四、怎么快速上手
+
+### 4.1 先决条件
+
+| 需要什么 | 说明 |
+| --- | --- |
+| **PostgreSQL** | 必需，系统的所有数据都存这儿 |
+| **LLM API Key** | 必需（探索要用），`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`，也可以在 UI 里配 |
+| **Docker**（推荐） | 一键部署走这条路 |
+| **Go + Node.js**（源码编译才需要） | Go 版本见 `go.mod`（`go 1.26.10`），前端用 Node.js 22 |
+
+### 4.2 方式一：一键安装脚本（推荐）
+
+```bash
+git clone https://github.com/RuoJi6/ARTEX.git
+cd ARTEX
+./install.sh
+```
+
+脚本会先检测 Docker（没装会问你是否自动安装），然后让你选：
+
+- **① 全部 Docker**：填一个 Postgres 密码（**可以直接回车随机生成**）→ 自动写 `.env` → `docker compose up -d`
+- **② 本地运行**：选数据库（连已有的 / 用 Docker 起一个）→ 生成 `config.json` → `go` 编译内嵌单二进制 → 启动
+
+装好后打开 **http://localhost:8787**，**首次进入 `/setup` 设置管理员密码**。
+
+### 4.3 方式二：Docker Compose（手动）
+
+```bash
+git clone https://github.com/RuoJi6/ARTEX.git
+cd ARTEX
+cp .env.example .env          # 填 POSTGRES_PASSWORD，可选 ANTHROPIC_API_KEY
+docker compose up -d          # 拉取 ruoji6/artex 镜像 + postgres
+# → http://localhost:8787
+```
+
+镜像里已经带了常用工具：`ripgrep` / `curl` / `vim` / `npm` / `nmap` 等。
+`./skills` 和 `./data` 用绑定挂载持久化 —— **改 skill 不用重建镜像**。
+
+`.env` 关键项：
+
+```dotenv
+ARTEX_IMAGE=ruoji6/artex
+ARTEX_TAG=latest          # 可固定为 v0.3.17 这样的具体版本
+POSTGRES_USER=artex
+POSTGRES_PASSWORD=your-password-here
+POSTGRES_DB=artex
+ANTHROPIC_API_KEY=
+OPENAI_API_KEY=
+```
+
+镜像支持 `linux/amd64` 和 `linux/arm64`，Docker 会自动选匹配架构 —— **ARM64 的 Kali 机器不用自己编译**。
+
+### 4.4 方式三：下载预编译二进制（Releases）
+
+从 [Releases](https://github.com/RuoJi6/ARTEX/releases) 下载对应平台的 zip，解压后得到：
+
+```
+artex          ← 主程序
+start.sh       ← 守护脚本（Windows 是 start.bat）
+skills/        ← 技能包
+config.example.json
+```
+
+```bash
+cp config.example.json config.json   # 填好 database 连接
+./start.sh                           # → http://localhost:8787
+```
+
+> ⚠️ **一定要用 `./start.sh` 启动，不要直接跑 `./artex`。**
+> `start.sh` 是守护脚本：程序退出后按退出码决定是否重新拉起，**页面上的「一键更新」靠它完成换装**。直接跑 `./artex` 的话，更新完就不会被拉起了。
+>
+> 后台常驻：`nohup ./start.sh >artex.log 2>&1 &`
+
+平台选择：Linux ARM64（含 ARM64 Kali）选 `linux-arm64`，x86_64 选 `linux-amd64`。
+
+### 4.5 方式四：从源码编译单二进制
+
+```bash
+# 1) 前端静态导出
+cd web && npm ci && npm run build:static && cd ..
+# 2) 拷进内嵌目录
+cp -r web/out server/webui/dist
+# 3) 编译（-tags embedui 才内嵌前端）
+CGO_ENABLED=0 go build -tags embedui -o artex ./cmd/artex
+./start.sh
+```
+
+### 4.6 方式五：构建跨平台 Release 包（维护者用）
+
+```bash
+./build.sh --release
+# 产物：dist/artex-0.3.3-*.zip
+```
+
+默认生成 Linux amd64/arm64、macOS amd64/arm64、Windows amd64 五个平台的 zip。
+
+### 4.7 本地开发与测试
+
+```bash
+./dev.sh    # 后端(:8787) + 流量代理(:8788) + 前端 next dev(:5173) → http://localhost:5173
+```
+
+- 后端：`go run ./cmd/artex`（不带 `-tags embedui` 则不内嵌前端）
+- 前端：`cd web && npm run dev`（`/api` 反代到后端，带热更新）
+- 测试：`go test ./...`
+- Mock 预览（不需要后端）：`cd web && NEXT_PUBLIC_MOCK=1 npm run dev`
+
+### 4.8 配置文件格式（`config.json`）
+
+```json
+{
+  "database": {
+    "host": "127.0.0.1", "port": 5432,
+    "user": "artex", "password": "yourpass",
+    "dbname": "artex", "sslmode": "disable"
+  }
+}
+```
+
+也可以用环境变量 `ARTEX_PG_DSN` 直接覆盖整个连接串。
+
+LLM 配置（也可以在 UI 的「LLM 配置」页填）：
+
+```bash
+export ANTHROPIC_API_KEY=sk-...
+# 可选
+export ARTEX_LLM_PROVIDER=
+export ARTEX_LLM_MODEL=
+export ARTEX_LLM_BASE_URL=
+export ARTEX_LLM_PROXY=
+```
+
+### 4.9 常用启动参数
+
+```bash
+./start.sh -addr :8787 -proxy :8788
+```
+
+- `-addr` —— 前端 + API 端口（默认 `:8787`）
+- `-proxy` —— 流量录制代理端口（默认 `:8788`）
+
+`start.sh` 会把参数**原样透传**给 `artex`。
+
+### 4.10 在线 Demo（不用自己装就能看界面）
+
+- 地址：https://artex-demo-ruoji6.vercel.app/
+- Demo **只运行 `web/` 前端**，构建时启用 `NEXT_PUBLIC_MOCK=1`
+- **不需要** Go、PostgreSQL 或模型密钥
+- 界面是**模拟数据，不执行真实扫描**
+
+---
+
+## 五、常见问题 / 注意事项
+
+### 坑 1：更新会中断正在跑的任务
+
+页面「一键更新」本质是**换二进制 + 重启**。请在空闲时做。
+
+### 坑 2：更新失败不会留下坏程序
+
+机制设计得很稳：
+- 校验或冒烟测试不通过 → 丢弃暂存件，继续跑当前版本
+- 换装后的新版连续 3 次启动失败 → 自动回滚到 `artex.old`（失败的那个留作 `artex.failed` 排查）
+- 上一版本保留为 `artex.old`，卡片上有「回滚到上一版本」按钮
+- ⚠️ **但数据库结构不会回退**，回滚前请确认
+
+### 坑 3：Docker 下只换程序、不换镜像
+
+镜像里的 playwright / nmap 等工具链**不会**跟着程序升级。而且 `docker compose up -d` 重建容器后会退回镜像自带的版本。
+
+要连镜像一起升：
+
+```bash
+docker compose pull artex && docker compose up -d artex
+```
+
+### 坑 4：反代不关缓冲，SSE 一直转圈
+
+SSE 是长连接 + 持续推送，**反代必须关闭缓冲**，否则浏览器连上了却收不到事件。
+
+Nginx 关键配置：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:8787;
+    proxy_buffering off;         # ← SSE 关键
+    proxy_cache off;
+    proxy_read_timeout 3600s;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+}
+```
+
+好消息是：前端和 API/SSE 都由**同一个后端端口**（`:8787`）提供，实时活动流走**同源**地址，所以**不需要配置 `NEXT_PUBLIC_SSE_BASE`**，公网只开 443、8787 留在内网即可。
+
+### 坑 5：忘了 HTTP Basic Auth 的密码
+
+改密码需要验证原密码 + 二次确认新密码（**这不是 TOTP 那种独立第二因素**）。如果忘了独立验证密码，可以连数据库执行：
+
+```sql
+UPDATE settings
+SET value = jsonb_set(value::jsonb, '{enabled}', 'false'::jsonb)::text,
+    updated_at = now()
+WHERE key = 'auth.http_basic';
+```
+
+然后重启 ARTEX，用原有 ARTEX 账号登录后重新配置。
+
+### 坑 6：Docker 里 `127.0.0.1` 指容器自己
+
+如果你在 Docker 里配置代理地址，`127.0.0.1` 指的是**容器自身**，不是宿主机。宿主机上跑的代理要写容器能访问的地址，比如 Docker Desktop 通常是 `http://host.docker.internal:7897`。
+
+### 坑 7：数据库迁移不用手动执行
+
+`artex` 每次启动会**幂等重跑** `schema.sql`（含 `ADD COLUMN` / `CREATE INDEX IF NOT EXISTS`），也就是**「重启即迁移」**。
+
+但升级前仍建议先备份 `./data` 和数据库。
+
+### 坑 8：忘了启动时数据库密码没改
+
+`docker-compose.yml` 里写的是 `${POSTGRES_PASSWORD:?请在 .env 设置 POSTGRES_PASSWORD}` —— **没设就直接报错退出**，这是故意的。`.env.example` 里默认是 `change-me-please`，**必须改掉**。
+
+### 坑 9：并发 work agent 数量
+
+默认每个任务 3 个 work agent，在「系统设置」里配置。调太大容易把 API Key 打爆或者触发上游限流。
+
+### 坑 10：`/v1/*` 和 `/health` 不受安全入口影响
+
+「安全入口」把控制台从 `/` 移到 `/<入口>`，`/health` 和 `/v1/*` 不受影响。它是**额外的入口隐藏措施，不代替登录认证**。保存设置后记得记录新的登录地址。
+
+---
+
+## 六、目录结构速览
+
+```
+ARTEX-/
+├── cmd/artex/              ← 程序入口（main.go，编译成单个二进制）
+├── server/                 ← HTTP 层（net/http）
+│   ├── server.go             主路由
+│   ├── auth.go / basic_auth.go   JWT 鉴权 / HTTP Basic Auth
+│   ├── manager.go            任务、引擎、store 的生命周期托管
+│   ├── engine.go             引擎调度循环
+│   ├── conversations.go      会话
+│   ├── findings*.go          漏洞相关（归并、报告、复测、流量）
+│   ├── intercept.go          拦截审批
+│   ├── llmpool.go / llmretry.go  LLM 池与重试
+│   ├── schedules.go / calendar_schedule.go  定时任务
+│   ├── intelligence.go       任务情报
+│   ├── sync_scopesentry.go   ScopeSentry 资产同步
+│   ├── update.go             在线更新
+│   └── webui_embed.go        前端内嵌
+├── agent/                  ← AI Agent 层（norma SDK）
+│   ├── planner.go            规划者（唯一意图生成者）
+│   ├── worker.go             执行者
+│   ├── mainagent.go          人在环路
+│   ├── goals.go              目标分解与范围提取
+│   ├── tools.go              工具集（双图暴露成 LLM 工具）
+│   ├── toolcatalog.go        工具目录
+│   ├── finding_recorder.go   漏洞记录
+│   ├── retester.go           漏洞复测 agent
+│   ├── intelligence.go       情报上报
+│   ├── credentials.go        凭据处理
+│   ├── capture.go            流量捕获
+│   └── promptcatalog.go      提示词目录
+├── db/                     ← 数据层（PostgreSQL / pgx）
+│   ├── schema.sql            表结构（启动时幂等执行）
+│   ├── assets.go              资产图
+│   ├── exploration.go         探索图
+│   ├── task_scope.go          任务范围
+│   ├── findings.go            漏洞
+│   ├── finding_cases.go       漏洞归并
+│   ├── intercept.go           拦截
+│   ├── llm_usage.go / llmhealth.go  LLM 用量与健康
+│   ├── tasks.go / task_archives.go  任务与归档
+│   └── settings.go            系统设置
+├── web/                    ← Next.js 前端（静态导出后内嵌）
+│   ├── src/
+│   ├── package.json
+│   └── vercel.json
+├── traffic/                ← 流量录制代理（MITM + CA 留痕）
+│   ├── proxy.go              代理主逻辑
+│   ├── evidence.go           证据收集
+│   └── archive.go            归档
+├── guard/                  ← 审批门（工具执行前拦截）
+├── intercept/              ← 拦截执行与判定
+├── enrich/                 ← DNS / HTTP 异步补全
+├── llmpool/                ← LLM 连接池与健康策略
+├── llmrec/                 ← LLM 调用录制
+├── mcphttp/                ← MCP HTTP / SSE 客户端
+├── notify/                 ← 通知渠道（邮件/飞书/钉钉/webhook）
+├── report/                 ← 报告生成
+├── evidence/               ← 证据存储
+├── sidequestion/           ← 旁路提问
+├── selfupdate/             ← 自更新
+├── skills/                 ← 技能包（可用目录挂载覆盖）
+│   ├── api-recon/            API 侦察
+│   ├── playwright-cli/       浏览器自动化
+│   └── scopesentry/          资产同步
+├── config/                 ← 配置读取
+├── db/schema.sql           ← 建表脚本
+├── docs/                   ← 文档（如「漏洞流量证据.md」）
+├── screenshots/            ← README 用的截图
+├── cmd/, docker-compose.yml, docker-compose.bench.yml
+├── Dockerfile, build.sh, install.sh, update.sh, dev.sh, reset-password.sh
+├── .env.example, config.example.json
+├── go.mod / go.sum          ← Go 依赖（norma、pgx、mitmproxy、dnsx…）
+└── CHANGELOG.md / LICENSE (AGPL-3.0)
+```
+
+### 关键文件一句话解释
+
+| 文件/目录 | 一句话说明 |
+| --- | --- |
+| `cmd/artex/main.go` | 整个系统的入口，一个二进制跑全部东西 |
+| `agent/planner.go` | **唯一**能生成「意图」的角色，整个系统的调度核心 |
+| `agent/worker.go` | 真正执行工具调用的 worker |
+| `db/exploration.go` | 探索图的读写（goal/intent/fact/finding） |
+| `db/assets.go` | 资产图的读写（跨任务共享的真值库） |
+| `traffic/` | 流量录制 —— 漏洞报告的证据从这来 |
+| `guard/` + `intercept/` | 审批门：敏感操作要人点头才放行 |
+| `skills/` | 可热插拔的技能包，**改完不用重建镜像** |
+| `db/schema.sql` | 所有表结构，**启动时幂等执行** = 重启即迁移 |
+| `install.sh` | 一键安装，Docker / 本地编译二选一 |
+| `build.sh` | 构建五个平台的 Release 包 |
+| `docker-compose.yml` | PostgreSQL + ARTEX 两个服务 |
+
+---
+
+## 七、本仓库说明
+
+| 项目 | 说明 |
+| --- | --- |
+| **本仓库** | `aiwozhonghua81/ARTEX-` —— 一个 **fork（派生仓库）** |
+| **上游项目** | **ARTEX**（AI 自主渗透测试系统） |
+| **上游地址** | https://github.com/RuoJi6/ARTEX |
+| **上游的原始出处** | https://github.com/Autumn-27/ARTEX（提交历史与 AGPL-3.0 许可证均保留自此） |
+| **技术栈** | Go 1.26 后端 + Next.js 前端 + PostgreSQL |
+| **许可证** | **AGPL-3.0**（衍生作品必须同样开源；网络提供服务也要公开源码） |
+| **Docker 镜像** | `ruoji6/artex`（Docker Hub，由本仓库 GitHub Actions 构建） |
+| **本仓库改动** | 仅在 README 顶部新增本中文说明区块；**未修改任何源码文件** |
+
+### README 的结构
+
+```
+┌─────────────────────────────────────────────┐
+│  👆 本节：中文详细说明（面向普通读者）        │  ← 本次新增
+├─────────────────────────────────────────────┤
+│  👇 下方：上游 README 原文（未删改）           │  ← 上游 RuoJi6/ARTEX 撰写
+└─────────────────────────────────────────────┘
+```
+
+- 上游 README 共 **630 行**，本身就是中文，内容非常详尽：12 张界面截图、5 种安装方式、5 种更新方式、完整配置说明（含 Nginx 反代、HTTP Basic Auth）、详细的双图架构图和 Mermaid 流程图、以及**完整的许可与免责声明**。**这些内容全部保留在下方。**
+- 本中文区块是**面向新读者的导读**，重点补充了：架构是怎么想的、每个坑的具体成因和后果、以及每个目录到底在干什么。
+- **特别提醒**：下游的「许可与免责声明」章节（AGPL-3.0 + 严禁攻击线上系统）在原文里，请务必读完再使用。
+
+---
+
+## 📌 快速自查清单
+
+- [ ] **已经明确自己的合法使用场景**（本地隔离环境 / 授权靶场）
+- [ ] PostgreSQL 已就绪，`.env` 里的 `POSTGRES_PASSWORD` **已改掉默认值**
+- [ ] LLM API Key 已配（`ANTHROPIC_API_KEY` 或 `OPENAI_API_KEY`）
+- [ ] 首次访问 `/setup` 已设置管理员密码
+- [ ] 用的是 `./start.sh` 启动（不是直接跑 `./artex`）
+- [ ] 要对外暴露时：配了 HTTPS 反代 + 关闭了 SSE 缓冲 + 开了 Basic Auth
+- [ ] 升级前备份了 `./data` 和数据库
+
+---
+
+<!-- 中文说明结束 -->
+
+---
+
+↓ **上游 README 原文开始**（以下内容来自 [RuoJi6/ARTEX](https://github.com/RuoJi6/ARTEX)，未做任何删改） ↓
+
 <div align="center">
 
 # ARTEX
